@@ -28,12 +28,35 @@ class SocketTransport:
             ) from exc
 
     def send_json(self, payload: dict) -> dict:
-        if self._sock is None:
-            self.connect()
+        # The addon's socket server is one-connection-per-command: it closes
+        # the connection right after writing its reply (see
+        # blender_addon/socket_server.py). A persistent client socket would
+        # be reading from a connection the peer already closed on every call
+        # after the first, which yields an empty recv() (EOF) and a
+        # `json.loads("")` crash. So reconnect fresh for every request.
+        self.connect()
         assert self._sock is not None
-        self._sock.sendall(json.dumps(payload).encode("utf-8"))
-        raw = self._sock.recv(RECV_BUFFER_BYTES)
+        try:
+            self._sock.sendall(json.dumps(payload).encode("utf-8"))
+            raw = self._read_full_response()
+        finally:
+            self.close()
+        if not raw:
+            raise EngineConnectionError(
+                f"{self._host}:{self._port} closed the connection without a reply"
+            )
         return json.loads(raw.decode("utf-8"))
+
+    def _read_full_response(self) -> bytes:
+        """Read until the peer closes the connection (end of one reply)."""
+        assert self._sock is not None
+        chunks: list[bytes] = []
+        while True:
+            chunk = self._sock.recv(RECV_BUFFER_BYTES)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     def close(self) -> None:
         if self._sock is not None:
